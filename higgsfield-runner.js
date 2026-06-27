@@ -126,6 +126,25 @@
     const v = k && el[k] && el[k].value;
     return typeof v === 'string' ? v : null;
   }
+  async function replaceLexicalValue(editor, text) {
+    const lexical = editor.__lexicalEditor;
+    if (!lexical) return false;
+
+    const nodes = [...lexical.getEditorState()._nodeMap.values()];
+    const Paragraph = nodes.find(n => n.__type === 'paragraph')?.constructor;
+    const Text = nodes.find(n => n.__type === 'text')?.constructor;
+    if (!Paragraph || !Text) return false;
+
+    lexical.update(() => {
+      const root = lexical.getEditorState()._nodeMap.get('root');
+      root.clear();
+      root.append(new Paragraph().append(new Text(text)));
+    });
+
+    const dl = Date.now() + 4000;
+    while ((editor.textContent || '') !== text && Date.now() < dl) await sleep(100);
+    return (editor.textContent || '') === text;
+  }
   async function setPrompt(text) {
     const editor = findPromptEditor();
     if (!editor) throw new Error('Prompt editor not found');
@@ -150,29 +169,12 @@
     }
 
     // Legacy Lexical contenteditable path.
-    document.execCommand('selectAll', false, null);
-    let pasted = false;
-    try {
-      const dt = new DataTransfer();
-      dt.setData('text/plain', text);
-      editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-      pasted = true;
-    } catch (e) { warn('paste path threw, will try insertText', e); }
-    const curLen = () => (editor.textContent || '').trim().length;
-    let dl = Date.now() + 4000;
-    while (curLen() < need && Date.now() < dl) await sleep(150);
-    if (curLen() < need) {                                  // paste didn't take — insertText fallback
-      editor.focus();
-      document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, text);
-      pasted = false;
-      dl = Date.now() + 3000;
-      while (curLen() < need && Date.now() < dl) await sleep(150);
+    // Synthetic paste appends in Lexical even after execCommand('selectAll'). Replace the
+    // editor state directly so every row starts with exactly its own prompt.
+    if (!await replaceLexicalValue(editor, text)) {
+      throw new Error('Prompt replace failed (Lexical) — editor internals changed');
     }
-    const got = curLen();
-    if (got < 5) throw new Error('Prompt did not stick — editor selector changed');
-    if (got < need) warn('prompt only partially set (' + got + '/' + want + ' chars)');
-    log('prompt set (' + got + '/' + want + ' chars)' + (pasted ? '' : ' [insertText fallback]'));
+    log('prompt replaced (' + want + '/' + want + ' chars)');
   }
 
   // Remove every start frame already attached (so each row REPLACES, never stacks).
