@@ -4,11 +4,10 @@
  *
  *  WHAT IT DOES  (one generation at a time, fully sequential)
  *    For each CSV row:
- *      1. Removes any start-frame image already attached to the form.
- *      2. Opens "Upload media", uploads the row's image through the assets picker,
+ *      1. Replaces and verifies the prompt; a prompt failure halts the batch.
+ *      2. Removes any start-frame image already attached to the form.
+ *      3. Opens "Upload media", uploads the row's image through the assets picker,
  *         waits for eligibility, and attaches it as the start frame.
- *      3. Replaces the prompt through the active React textarea or Lexical editor,
- *         so Generate cannot submit empty, stale, or appended prompt text.
  *      4. Clicks Generate, waits for the job card to appear (queued),
  *         then polls its status until it flips to "completed"
  *         (queued → in_progress → completed) before starting the next row.
@@ -146,24 +145,48 @@
     const v = k && el[k] && el[k].value;
     return typeof v === 'string' ? v : null;
   }
-  async function replaceLexicalValue(editor, text) {
-    const lexical = editor.__lexicalEditor;
-    if (!lexical) return false;
+  // Lexical renders newlines as separate paragraphs; innerText may add extra line breaks.
+  // Whitespace-normalized equality still catches stale/appended text without false failures.
+  const normalizedPrompt = text => String(text || '').replace(/\s+/g, ' ').trim();
+  function currentPrompt(editor = findPromptEditor()) {
+    if (!editor) return '';
+    return normalizedPrompt(editor.tagName === 'TEXTAREA' ? editor.value : editor.innerText);
+  }
+  function promptMatches(editor, text) {
+    return currentPrompt(editor) === normalizedPrompt(text);
+  }
 
-    const nodes = [...lexical.getEditorState()._nodeMap.values()];
-    const Paragraph = nodes.find(n => n.__type === 'paragraph')?.constructor;
-    const Text = nodes.find(n => n.__type === 'text')?.constructor;
-    if (!Paragraph || !Text) return false;
+  // Current Higgsfield Lexical nodes do not expose an editor instance on the DOM.
+  // Select all content and use the browser's native editing command so Lexical receives
+  // a real input transaction. Direct textContent/innerHTML assignment is only cosmetic.
+  async function replaceContentEditableValue(editor, text) {
+    const selectEverything = () => {
+      editor.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
+    const waitForMatch = async ms => {
+      const dl = Date.now() + ms;
+      while (!promptMatches(editor, text) && Date.now() < dl) await sleep(100);
+      return promptMatches(editor, text);
+    };
 
-    lexical.update(() => {
-      const root = lexical.getEditorState()._nodeMap.get('root');
-      root.clear();
-      root.append(new Paragraph().append(new Text(text)));
-    });
+    selectEverything();
+    try { document.execCommand('insertText', false, text); } catch (_) {}
+    if (await waitForMatch(2500)) return true;
 
-    const dl = Date.now() + 4000;
-    while ((editor.textContent || '') !== text && Date.now() < dl) await sleep(100);
-    return (editor.textContent || '') === text;
+    // One fallback pass mirrors Cmd/Ctrl+A → Backspace → type.
+    selectEverything();
+    try {
+      document.execCommand('delete', false);
+      document.execCommand('insertText', false, text);
+    } catch (_) {
+      return false;
+    }
+    return waitForMatch(2500);
   }
   async function setPrompt(text) {
     const editor = findPromptEditor();
@@ -184,17 +207,23 @@
       const got = Math.min(domLen, reactLen);
       if (got < 5) throw new Error('Prompt did not stick (textarea) — selector changed');
       if (got < need) warn('prompt only partially set (' + got + '/' + want + ' chars)');
+      if (!promptMatches(editor, text) || (rv !== null && normalizedPrompt(rv) !== normalizedPrompt(text)))
+        throw new Error('Prompt replace failed (textarea)');
       log('prompt set (dom ' + domLen + ' / react ' + (rv === null ? 'n/a' : reactLen) + ' / want ' + want + ')');
       return;
     }
 
-    // Legacy Lexical contenteditable path.
-    // Synthetic paste appends in Lexical even after execCommand('selectAll'). Replace the
-    // editor state directly so every row starts with exactly its own prompt.
-    if (!await replaceLexicalValue(editor, text)) {
-      throw new Error('Prompt replace failed (Lexical) — editor internals changed');
+    // Lexical/contenteditable path.
+    if (!await replaceContentEditableValue(editor, text)) {
+      throw new Error('Prompt replace failed (Lexical/contenteditable)');
     }
     log('prompt replaced (' + want + '/' + want + ' chars)');
+  }
+
+  function assertPrompt(text) {
+    const editor = findPromptEditor();
+    if (!editor || !promptMatches(editor, text))
+      throw new Error('Prompt verification failed before Generate');
   }
 
   // Remove every start frame already attached (so each row REPLACES, never stacks).
@@ -510,8 +539,9 @@
     log('TEST row 1 →', r.image);
     const img = state.images.get(r.image);
     if (!img) { warn('no image file for ' + r.image); return; }
-    await uploadFrame(img);
     await setPrompt(r.prompt);
+    await uploadFrame(img);
+    assertPrompt(r.prompt);
     log('TEST done — prompt + start frame set. Generate was NOT clicked.');
   }
 
@@ -531,18 +561,30 @@
         try {
           const img = state.images.get(r.image);
           if (!img) { warn('skipping — no image file for ' + r.image); summary.skipped.push(r.image + ' (no image)'); continue; }
+          // Fail before touching the image if Higgsfield changes its prompt editor.
+          try {
+            await setPrompt(r.prompt);
+          } catch (promptError) {
+            throw new Error('Prompt setup failed — ' + (promptError.message || promptError));
+          }
           if (r.image === lastImage && (startFrameImg() || removeButtons().length > 0)) {
             log('reusing start frame already attached: ' + r.image);          // same image still on the form — nothing to do
           } else {
             await uploadFrame(img);                                           // new image via assets picker
             lastImage = r.image;
           }
-          await setPrompt(r.prompt);
+          assertPrompt(r.prompt);                         // picker must not disturb the prompt
           const res = await clickGenerateAndWait();      // blocks until completed OR a terminal status
           if (res.ok) { log('✅ row ' + (i + 1) + ' done — ' + r.image); summary.done.push(r.image); }
           else { warn('⏭️ row ' + (i + 1) + ' skipped — ' + r.image + ' (' + res.status + ')'); summary.skipped.push(r.image + ' (' + res.status + ')'); }
         } catch (e) {
           if (String(e.message || e).includes('stopped')) { warn('stopped at row ' + (i + 1)); break; }
+          if (/^Prompt (setup|verification) failed/i.test(String(e.message || e))) {
+            err('row ' + (i + 1) + ' [' + r.image + '] fatal prompt error — batch halted:', e.message || e);
+            summary.skipped.push(r.image + ' (prompt error)');
+            state.stopped = true;
+            break;
+          }
           err('row ' + (i + 1) + ' [' + r.image + '] error — skipping to next:', e.message || e);
           summary.skipped.push(r.image + ' (error)');
         }
