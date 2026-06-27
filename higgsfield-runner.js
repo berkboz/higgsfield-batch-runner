@@ -4,7 +4,7 @@
  *
  *  WHAT IT DOES  (one generation at a time, fully sequential)
  *    For each CSV row:
- *      1. Replaces and verifies the prompt; a prompt failure halts the batch.
+ *      1. Replaces and verifies the prompt; mismatches are cleared and retried.
  *      2. Removes any start-frame image already attached to the form.
  *      3. Opens "Upload media", uploads the row's image through the assets picker,
  *         waits for eligibility, and attaches it as the start frame.
@@ -46,6 +46,7 @@
   // ---- tunables ---------------------------------------------------------------
   const CFG = {
     clearTimeoutMs:    10000,         // max time to remove existing start frame(s)
+    promptRetryMs:     1500,          // pause before clearing/re-pasting a mismatched prompt
     uploadTimeoutMs:   60000,         // max wait for an uploaded file to appear in the picker grid
     eligTimeoutMs:     40000,         // max wait for the picker eligibility check
     selectDelayMs:     6000,          // wait per attempt for the selected frame to attach
@@ -213,7 +214,7 @@
     }
     return Boolean(await waitForPrompt(text, 5000));
   }
-  async function setPrompt(text) {
+  async function setPromptAttempt(text) {
     const editor = findPromptEditor();
     if (!editor) throw new Error('Prompt editor not found');
     const want = text.trim().length;
@@ -246,10 +247,35 @@
     log('prompt replaced (' + want + '/' + want + ' chars)');
   }
 
-  function assertPrompt(text) {
+  // Higgsfield can commit a Lexical paste several seconds late or replace the editor
+  // node during a generation. Never abort/skip a row for that transient mismatch:
+  // reacquire, clear and paste again until the active editor is exactly correct.
+  async function setPrompt(text) {
+    let attempt = 0;
+    while (!state.stopped) {
+      attempt++;
+      const live = findPromptEditor();
+      if (live && promptMatches(live, text)) {
+        log('prompt verified' + (attempt > 1 ? ' after ' + attempt + ' attempts' : ' (already correct)'));
+        return;
+      }
+      try {
+        await setPromptAttempt(text);
+        return;
+      } catch (e) {
+        warn('prompt mismatch — clearing and retrying (attempt ' + attempt + '): '
+          + (e.message || e));
+        await sleep(CFG.promptRetryMs);
+      }
+    }
+    throw new Error('stopped');
+  }
+
+  async function ensurePrompt(text) {
     const editor = findPromptEditor();
-    if (!editor || !promptMatches(editor, text))
-      throw new Error('Prompt verification failed before Generate');
+    if (editor && promptMatches(editor, text)) return;
+    warn('prompt changed before Generate — repairing it now');
+    await setPrompt(text);
   }
 
   // Remove every start frame already attached (so each row REPLACES, never stacks).
@@ -567,7 +593,7 @@
     if (!img) { warn('no image file for ' + r.image); return; }
     await setPrompt(r.prompt);
     await uploadFrame(img);
-    assertPrompt(r.prompt);
+    await ensurePrompt(r.prompt);
     log('TEST done — prompt + start frame set. Generate was NOT clicked.');
   }
 
@@ -603,7 +629,7 @@
             await uploadFrame(img);                                           // new image via assets picker
             lastImage = r.image;
           }
-          assertPrompt(r.prompt);                         // picker must not disturb the prompt
+          await ensurePrompt(r.prompt);                   // repair if picker disturbed it
           const res = await clickGenerateAndWait();      // blocks until completed OR a terminal status
           if (res.ok) { log('✅ row ' + (i + 1) + ' done — ' + r.image); summary.done.push(r.image); }
           else { warn('⏭️ row ' + (i + 1) + ' skipped — ' + r.image + ' (' + res.status + ')'); summary.skipped.push(r.image + ' (' + res.status + ')'); }
@@ -611,13 +637,6 @@
           if (String(e.message || e).includes('stopped')) {
             summary.haltReason = 'stop requested';
             warn('stopped at row ' + (i + 1));
-            break;
-          }
-          if (/^Prompt (setup|verification) failed/i.test(String(e.message || e))) {
-            err('row ' + (i + 1) + ' [' + r.image + '] fatal prompt error — batch halted:', e.message || e);
-            summary.skipped.push(r.image + ' (prompt error)');
-            summary.haltReason = e.message || String(e);
-            state.stopped = true;
             break;
           }
           err('row ' + (i + 1) + ' [' + r.image + '] error — skipping to next:', e.message || e);
