@@ -156,37 +156,48 @@
     return currentPrompt(editor) === normalizedPrompt(text);
   }
 
-  // Current Higgsfield Lexical nodes do not expose an editor instance on the DOM.
-  // Select all content and use the browser's native editing command so Lexical receives
-  // a real input transaction. Direct textContent/innerHTML assignment is only cosmetic.
-  async function replaceContentEditableValue(editor, text) {
-    const selectEverything = () => {
+  async function waitForPrompt(editor, text, ms) {
+    const dl = Date.now() + ms;
+    while (!promptMatches(editor, text) && Date.now() < dl) await sleep(100);
+    return promptMatches(editor, text);
+  }
+
+  // Delete first, then paste into an EMPTY Lexical editor. Pasting over a selection can
+  // append instead of replace; insertText with a multiline string can keep only fragments.
+  async function clearContentEditableValue(editor) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       editor.focus();
-      const selection = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    };
-    const waitForMatch = async ms => {
-      const dl = Date.now() + ms;
-      while (!promptMatches(editor, text) && Date.now() < dl) await sleep(100);
-      return promptMatches(editor, text);
-    };
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+      if (await waitForPrompt(editor, '', 1200)) return true;
+    }
+    return false;
+  }
+  async function replaceContentEditableValue(editor, text) {
+    if (!await clearContentEditableValue(editor)) return false;
 
-    selectEverything();
-    try { document.execCommand('insertText', false, text); } catch (_) {}
-    if (await waitForMatch(2500)) return true;
-
-    // One fallback pass mirrors Cmd/Ctrl+A → Backspace → type.
-    selectEverything();
     try {
-      document.execCommand('delete', false);
-      document.execCommand('insertText', false, text);
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      editor.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: dt, bubbles: true, cancelable: true,
+      }));
+    } catch (_) {}
+    if (await waitForPrompt(editor, text, 5000)) return true;
+
+    // Fallback: start clean again and insert one paragraph at a time. This avoids
+    // Lexical's broken handling of one large multiline insertText transaction.
+    if (!await clearContentEditableValue(editor)) return false;
+    try {
+      const lines = text.replace(/\r\n?/g, '\n').split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (i) document.execCommand('insertParagraph', false, null);
+        if (lines[i]) document.execCommand('insertText', false, lines[i]);
+      }
     } catch (_) {
       return false;
     }
-    return waitForMatch(2500);
+    return waitForPrompt(editor, text, 5000);
   }
   async function setPrompt(text) {
     const editor = findPromptEditor();
@@ -215,7 +226,8 @@
 
     // Lexical/contenteditable path.
     if (!await replaceContentEditableValue(editor, text)) {
-      throw new Error('Prompt replace failed (Lexical/contenteditable)');
+      throw new Error('Prompt replace failed (Lexical/contenteditable; expected '
+        + normalizedPrompt(text).length + ', got ' + currentPrompt(editor).length + ' normalized chars)');
     }
     log('prompt replaced (' + want + '/' + want + ' chars)');
   }
