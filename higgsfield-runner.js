@@ -562,12 +562,16 @@
     if (state.running) { warn('already running'); return; }
     if (!state.rows.length) await load();
     state.stopped = false; state.running = true;
-    const summary = { done: [], skipped: [] };
+    const summary = { done: [], skipped: [], haltReason: null };
     let lastImage = null;   // reuse the attached frame across consecutive rows with the same image
     log('▶️ starting batch at row ' + (startIndex + 1) + ' of ' + state.rows.length);
     try {
       for (let i = startIndex; i < state.rows.length; i++) {
-        if (state.stopped) { warn('stopped at row ' + (i + 1)); break; }
+        if (state.stopped) {
+          summary.haltReason = summary.haltReason || 'stop requested';
+          warn('stopped at row ' + (i + 1));
+          break;
+        }
         const r = state.rows[i];
         log(`──── row ${i + 1}/${state.rows.length} — ${r.image} ────`);
         try {
@@ -590,10 +594,15 @@
           if (res.ok) { log('✅ row ' + (i + 1) + ' done — ' + r.image); summary.done.push(r.image); }
           else { warn('⏭️ row ' + (i + 1) + ' skipped — ' + r.image + ' (' + res.status + ')'); summary.skipped.push(r.image + ' (' + res.status + ')'); }
         } catch (e) {
-          if (String(e.message || e).includes('stopped')) { warn('stopped at row ' + (i + 1)); break; }
+          if (String(e.message || e).includes('stopped')) {
+            summary.haltReason = 'stop requested';
+            warn('stopped at row ' + (i + 1));
+            break;
+          }
           if (/^Prompt (setup|verification) failed/i.test(String(e.message || e))) {
             err('row ' + (i + 1) + ' [' + r.image + '] fatal prompt error — batch halted:', e.message || e);
             summary.skipped.push(r.image + ' (prompt error)');
+            summary.haltReason = e.message || String(e);
             state.stopped = true;
             break;
           }
@@ -602,7 +611,11 @@
         }
         await sleep(CFG.betweenRowsMs);
       }
-      log('🏁 batch finished — ' + summary.done.length + ' done, ' + summary.skipped.length + ' skipped');
+      if (summary.haltReason)
+        err('🛑 batch halted — ' + summary.done.length + ' done, ' + summary.skipped.length
+          + ' skipped — ' + summary.haltReason);
+      else
+        log('🏁 batch finished — ' + summary.done.length + ' done, ' + summary.skipped.length + ' skipped');
       if (summary.skipped.length) warn('skipped rows:', summary.skipped);
     } finally {
       state.running = false;
