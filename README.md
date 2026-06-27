@@ -2,8 +2,8 @@
 
 A single‑file **browser‑console** automation for [higgsfield.ai/ai/video](https://higgsfield.ai/ai/video).
 Paste it into DevTools, point it at a CSV of prompts and a folder of start‑frame images, and it
-generates videos **one at a time** — uploading each image, running Higgsfield's eligibility check,
-pasting the prompt, clicking **Generate**, and waiting for the job to finish before starting the next.
+generates videos **one at a time** — uploading each image as the start frame, setting the prompt,
+clicking **Generate**, and waiting for the job to finish before starting the next.
 
 No extension, no API keys, no build step. It just drives the page you're already logged into.
 
@@ -17,18 +17,23 @@ No extension, no API keys, no build step. It just drives the page you're already
 For every row in your CSV it:
 
 1. **Removes** any start‑frame image already attached to the form (so each row *replaces*, never stacks).
-2. **Uploads** the row's image via the "Upload media" picker (sets the hidden file input directly — no OS dialog).
-3. Runs the **"Check eligibility"** content check and waits for it to pass (or skips the row if *Not eligible*).
-4. **Selects** the uploaded image so it becomes the start frame.
-5. **Pastes** the prompt into the editor (and waits until it's fully committed).
-6. Clicks **Generate**, waits for the new job card to appear, then polls its status
+2. **Uploads** the row's image straight into the form's start‑frame file input (no OS dialog, no picker popover)
+   and waits for the upload to actually finish.
+3. **Sets** the prompt in the `<textarea>` via the native value setter, so React's state really updates
+   (otherwise Generate submits an empty/stale prompt — see *Why a textarea?* below).
+4. Clicks **Generate**, waits for the new job card to appear, then polls its status
    `queued → in_progress → completed` before moving on.
 
-If a job hits a terminal status (`ip_detected`, `failed`, `nsfw`, `moderated`, …) the row is **skipped**
-and the batch keeps going — it never hangs or aborts. A `done / skipped` summary is logged at the end.
+Moderation now happens at **generation** time: if a job hits a terminal status
+(`ip_detected`, `failed`, `nsfw`, `moderated`, …) the row is **skipped** and the batch keeps going —
+it never hangs or aborts. A `done / skipped` summary is logged at the end.
 
-**Repeated images are fast:** if several consecutive rows use the same image, it uploads + eligibility‑checks
-it **once**, then re‑attaches the already‑uploaded asset from the grid (~0.5 s) for the repeats.
+**Repeated images are fast:** if consecutive rows use the same image and it's still on the form,
+the upload step is skipped entirely for the repeats.
+
+> **Before you run:** pick your **Model** (e.g. *Enhanced Seedance*) and set the **Enhance** toggle the way
+> you want. The script uses whatever is currently selected — it doesn't change the model or enhance setting.
+> (With *Enhance* on, Higgsfield rewrites your prompt before generating.)
 
 ---
 
@@ -89,11 +94,10 @@ Tune the constants in the `CFG` block at the top of the script if needed:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `eligTimeoutMs` | `40000` | Max wait for the "Check eligibility" content check to resolve |
-| `uploadTimeoutMs` | `60000` | Max wait for an uploaded file to appear in the picker grid |
-| `selectDelayMs` | `6000` | Per‑attempt wait for the frame to attach after Select |
-| `selectMaxClicks` | `15` | Max Select clicks before giving up on attaching a frame |
+| `clearTimeoutMs` | `10000` | Max time to remove existing start frame(s) |
+| `uploadTimeoutMs` | `60000` | Max wait for the uploaded start frame to finish uploading |
 | `generateRetryMs` | `15000` | Wait for a job to start after clicking Generate, else re‑click |
+| `generateMaxClicks` | `6` | Max Generate clicks before giving up on a row |
 | `pollMs` | `3000` | How often to poll job status |
 | `jobDoneTimeout` | `1200000` | Max wait for a single job to complete (20 min) |
 | `stuckMs` | `90000` | An unknown, non‑running status stuck this long is treated as failed |
@@ -104,23 +108,32 @@ Tune the constants in the `CFG` block at the top of the script if needed:
 
 It targets the live DOM of the Create Video page:
 
-- Prompt editor: `[data-lexical-editor="true"][contenteditable="true"]`
+- Prompt input: the visible `<textarea>` inside `form.generate-form`
 - Generate button: a `<button>` in `form.generate-form` whose text matches `/generate/i`
-- Upload dropzone: the `min-h-[120px]` area (or the `+` button once a frame is attached)
-- Assets picker popover: `[data-assets-picker-popover="true"]`, with a hidden `input[type=file]`
-- Upload cards: `button[aria-label^="Select <id>"]` + a `Check eligibility` button per card
+- Start‑frame input: the **left‑most** `input[type=file][accept*=image]` in the form (the right one is the optional *end frame*)
+- Attached frame: an `<img alt="Uploaded image">`; the upload is "done" once its `src` becomes an `https://images.higgs.ai/…` URL (not a local `blob:` preview)
+- Remove (X) badge: a `<button>` with the `-top-2 -right-2` classes
 - Result/job cards: `[data-asset-id][data-job-status]` (`queued → in_progress → completed`)
 
 If Higgsfield changes its markup these selectors may need updating; `await HF.discover()` helps you see what's found.
+
+### Why a textarea?
+
+Higgsfield's prompt box is a **React‑controlled `<textarea>`**. Assigning `.value` (or pasting) updates the DOM
+but **not** React's internal state, so clicking Generate would submit an empty/old prompt. The script writes through
+the native `HTMLTextAreaElement.prototype.value` setter and dispatches a real `input` event, then verifies React's
+`__reactProps.value` actually picked up the text before clicking Generate. (Older builds used a Lexical
+`contenteditable`; the script still falls back to that if no textarea is present.)
 
 ---
 
 ## Troubleshooting
 
 - **Every row skips as "no image"** → your CSV filenames don't match the folder filenames (extension mismatch). Fix the CSV.
-- **The picker doesn't open / file dialog blocked** → make sure you ran `await HF.run()` (it mounts a real button you click); browsers block console‑triggered file pickers.
-- **A row is skipped with `ip_detected` / `Not eligible`** → Higgsfield's moderation flagged that image/prompt. That's the platform's filter, not the script.
-- **Wrong image gets attached** → make sure you're on the latest version; the grid loads asynchronously and the script now waits for it to settle before picking the freshly‑uploaded asset.
+- **It generated without my prompt / an empty‑looking video** → you were on an old version that targeted the Lexical editor; Higgsfield's prompt box is now a `<textarea>`. Update to the latest `higgsfield-runner.js`.
+- **Generate seems to do nothing on the first try** → the start frame hadn't finished uploading yet. The script waits for the upload to commit (img `src` → `images.higgs.ai`) before clicking, and re‑clicks Generate if no job appears.
+- **A row is skipped with `ip_detected`** → Higgsfield's moderation flagged that image/prompt at generation time. That's the platform's filter, not the script.
+- **Wrong model / prompt got rewritten** → the script doesn't touch the **Model** selector or the **Enhance** toggle. Set those manually before running.
 
 ---
 
