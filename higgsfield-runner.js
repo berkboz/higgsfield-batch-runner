@@ -147,14 +147,21 @@
     return typeof v === 'string' ? v : null;
   }
   // Lexical renders newlines as separate paragraphs; innerText may add extra line breaks.
-  // Whitespace-normalized equality still catches stale/appended text without false failures.
   const normalizedPrompt = text => String(text || '').replace(/\s+/g, ' ').trim();
-  function currentPrompt(editor = findPromptEditor()) {
+  // For EQUALITY we ignore all whitespace. Round-tripping through a Lexical editor drops or
+  // alters spaces at paragraph boundaries (e.g. "claims.\nOpening" → "claims.Opening"), which
+  // left the prompt 1–2 chars short of the target and made the strict === match loop forever.
+  // The words themselves still differ when the wrong/stale prompt is present, so this is safe.
+  const comparePrompt = text => String(text || '').replace(/\s+/g, '');
+  function rawPrompt(editor = findPromptEditor()) {
     if (!editor) return '';
-    return normalizedPrompt(editor.tagName === 'TEXTAREA' ? editor.value : editor.innerText);
+    return editor.tagName === 'TEXTAREA' ? (editor.value || '') : (editor.innerText || '');
+  }
+  function currentPrompt(editor = findPromptEditor()) {
+    return normalizedPrompt(rawPrompt(editor));
   }
   function promptMatches(editor, text) {
-    return currentPrompt(editor) === normalizedPrompt(text);
+    return comparePrompt(rawPrompt(editor)) === comparePrompt(text);
   }
 
   async function waitForPrompt(text, ms) {
@@ -245,7 +252,7 @@
       const got = Math.min(domLen, reactLen);
       if (got < 5) throw new Error('Prompt did not stick (textarea) — selector changed');
       if (got < need) warn('prompt only partially set (' + got + '/' + want + ' chars)');
-      if (!promptMatches(editor, text) || (rv !== null && normalizedPrompt(rv) !== normalizedPrompt(text)))
+      if (!promptMatches(editor, text) || (rv !== null && comparePrompt(rv) !== comparePrompt(text)))
         throw new Error('Prompt replace failed (textarea)');
       log('prompt set (dom ' + domLen + ' / react ' + (rv === null ? 'n/a' : reactLen) + ' / want ' + want + ')');
       return;
