@@ -5,10 +5,10 @@
  *  WHAT IT DOES  (one generation at a time, fully sequential)
  *    For each CSV row:
  *      1. Removes any start-frame image already attached to the form.
- *      2. Uploads the row's image straight into the form's start-frame file input
- *         (no picker popover) and waits for the upload to finish.
- *      3. Sets the prompt in the <textarea> (via the native setter so React's state
- *         actually updates — otherwise Generate submits an empty/stale prompt).
+ *      2. Opens "Upload media", uploads the row's image through the assets picker,
+ *         waits for eligibility, and attaches it as the start frame.
+ *      3. Replaces the prompt through the active React textarea or Lexical editor,
+ *         so Generate cannot submit empty, stale, or appended prompt text.
  *      4. Clicks Generate, waits for the job card to appear (queued),
  *         then polls its status until it flips to "completed"
  *         (queued → in_progress → completed) before starting the next row.
@@ -36,9 +36,9 @@
  *    image,prompt
  *    001.png,"long, multi-line ""prompt"" text ..."
  *
- *  Verified live on higgsfield.ai/ai/video: direct start-frame upload, the React
- *  <textarea> prompt set (confirmed submitted, not empty), start-frame replace, and
- *  the queued→in_progress→completed status lifecycle (job id stays stable throughout).
+ *  Verified live on higgsfield.ai/ai/video: picker-based start-frame upload, the
+ *  React/Lexical prompt replacement, start-frame replace, and the
+ *  queued→in_progress→completed status lifecycle.
  * ============================================================================= */
 
 (() => {
@@ -47,7 +47,10 @@
   // ---- tunables ---------------------------------------------------------------
   const CFG = {
     clearTimeoutMs:    10000,         // max time to remove existing start frame(s)
-    uploadTimeoutMs:   60000,         // max wait for the uploaded start frame to attach to the form
+    uploadTimeoutMs:   60000,         // max wait for an uploaded file to appear in the picker grid
+    eligTimeoutMs:     40000,         // max wait for the picker eligibility check
+    selectDelayMs:     6000,          // wait per attempt for the selected frame to attach
+    selectMaxClicks:   15,            // max Select retries
     generateRetryMs:   15000,         // after clicking Generate, wait this long for a job to start; else re-click
     generateMaxClicks: 6,             // max Generate clicks before giving up on a row
     pollMs:            3000,          // how often to poll job status
@@ -72,6 +75,7 @@
 
   // ---- element discovery (selectors verified against the live DOM) -------------
   const FORM   = () => document.querySelector('form.generate-form') || document;
+  const PICKER = () => document.querySelector('[data-assets-picker-popover="true"]');
 
   function findPromptEditor() {
     const form = FORM();
@@ -90,6 +94,21 @@
     return [...FORM().querySelectorAll('button')]
       .find(b => visible(b) && /generate/i.test(b.textContent || '')) || null;
   }
+  // Empty-state "Upload media" dropzone.
+  function findDropZone() {
+    return [...FORM().querySelectorAll('div')]
+      .find(d => hasCls(d, 'min-h-[120px]') && visible(d) && /upload media/i.test(d.textContent || '')) || null;
+  }
+  // The thumbnail grid and its "+" button, present when a frame is already attached.
+  function mediaGrid() {
+    return [...FORM().querySelectorAll('div')]
+      .find(d => hasCls(d, 'grid-cols-[repeat(3,48px)]')) || null;
+  }
+  function plusAddButton() {
+    const g = mediaGrid();
+    return g && [...g.querySelectorAll('button')]
+      .find(b => hasCls(b, 'size-[48px]') && hasCls(b, 'bg-surface-secondary')) || null;
+  }
   // The small X badge on each attached thumbnail (class -top-2 -right-2).
   function removeButtons() {
     return [...FORM().querySelectorAll('button')]
@@ -97,16 +116,17 @@
   }
 
   async function discover() {
-    const editor = findPromptEditor(), genBtn = findGenerateButton(), input = startFrameInput();
+    const editor = findPromptEditor(), genBtn = findGenerateButton(), zone = findDropZone();
     log('discover():');
     console.log('  prompt input  :', editor ? editor.tagName : '❌ NOT FOUND');
     console.log('  generate btn  :', genBtn || '❌ NOT FOUND');
-    console.log('  start-frame in:', input || '❌ NOT FOUND');
+    console.log('  upload trigger:', zone || plusAddButton() || '❌ NOT FOUND');
     console.log('  attached now  :', removeButtons().length, 'start frame(s)');
     if (editor) editor.style.outline = '2px solid #a3e635';
     if (genBtn) genBtn.style.outline = '2px solid #f59e0b';
-    setTimeout(() => [editor, genBtn].forEach(e => e && (e.style.outline = '')), 3000);
-    return { editor, genBtn, input };
+    if (zone) zone.style.outline = '2px solid #38bdf8';
+    setTimeout(() => [editor, genBtn, zone].forEach(e => e && (e.style.outline = '')), 3000);
+    return { editor, genBtn, zone };
   }
 
   // ---- prompt input ------------------------------------------------------------
@@ -193,50 +213,150 @@
     return removed;
   }
 
-  // ---- start-frame upload -----------------------------------------------------
-  // Higgsfield's current UI attaches the start frame via a direct <input type=file> in the
-  // form — the old assets-picker popover + per-card "Check eligibility" flow is GONE. The form
-  // exposes up to two image inputs: the LEFT slot = start frame, the RIGHT slot = optional end
-  // frame. We only ever set the start frame. Moderation now happens at GENERATION time (the job
-  // lands on a terminal status like ip_detected), which clickGenerateAndWait already handles.
-  function startFrameInput() {
-    const inputs = [...FORM().querySelectorAll('input[type="file"]')]
-      .filter(i => !i.hasAttribute('webkitdirectory') && /image/.test(i.accept || ''));
-    if (!inputs.length) return null;
-    return inputs.sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x)[0]; // leftmost = start
+  // ---- assets-picker start-frame upload --------------------------------------
+  // The form's "Upload media" card is only a trigger. Its hidden file input is mounted
+  // after the assets picker opens, so the picker must be opened before setting files.
+  function frameThumbs() {
+    return [...FORM().querySelectorAll('img')]
+      .filter(im => /uploaded image/i.test(im.alt || '')
+        || /images\.higgs\.ai|cloudfront|cdn\.higgsfield/.test(im.currentSrc || im.src || ''));
   }
-  // The attached start-frame thumbnail (alt="Uploaded image"), if any.
-  function startFrameImg() {
-    return [...FORM().querySelectorAll('img')].find(im => /uploaded image/i.test(im.alt || '')) || null;
+  function startFrameImg() { return frameThumbs()[0] || null; }
+  const frameSrcSet = () => new Set(frameThumbs().map(im => im.currentSrc || im.src));
+  async function waitForNewFrame(beforeSrcs, ms) {
+    const dl = Date.now() + ms;
+    while (Date.now() < dl) {
+      if (state.stopped) throw new Error('stopped');
+      if (frameThumbs().some(im => !beforeSrcs.has(im.currentSrc || im.src))) return true;
+      await sleep(400);
+    }
+    return false;
   }
 
-  // Upload one file as the start frame: clear old frame(s) → set the start-frame input's files
-  // directly (no OS dialog, no user-activation block) → wait for the thumbnail to attach.
+  function pickerFileInput() {
+    const p = PICKER();
+    return p && [...p.querySelectorAll('input[type="file"]')]
+      .find(i => !i.hasAttribute('webkitdirectory') && /image/.test(i.accept || '')) || null;
+  }
+  function pickerSelectButtons() {
+    const p = PICKER();
+    return p ? [...p.querySelectorAll('button[aria-label^="Select "]')] : [];
+  }
+  const selId = b => (b.getAttribute('aria-label') || '').slice(7);
+
+  async function openPicker() {
+    if (pickerFileInput()) return;
+    const trigger = findDropZone() || plusAddButton();
+    if (!trigger) throw new Error('Upload trigger not found (no dropzone or + button)');
+    trigger.click();
+    const dl = Date.now() + 6000;
+    while (Date.now() < dl) {
+      if (state.stopped) throw new Error('stopped');
+      if (pickerFileInput()) return;
+      await sleep(150);
+    }
+    throw new Error('assets picker did not open after clicking Upload media');
+  }
+  async function closePicker() {
+    const c = PICKER() && PICKER().querySelector('button[aria-label="Close assets picker"]');
+    if (c) { c.click(); await sleep(300); }
+  }
+
+  async function selectEligibleAsset(fid, framesBefore) {
+    const cardOf = () => {
+      const b = pickerSelectButtons().find(x => selId(x) === fid);
+      return b ? (b.closest('[data-assets-picker-media-card="true"]') || b.parentElement) : null;
+    };
+    const cardText = () => cardOf() ? (cardOf().textContent || '') : '';
+
+    await sleep(400);
+    let eligible = false;
+    const eDeadline = Date.now() + CFG.eligTimeoutMs;
+    while (Date.now() < eDeadline) {
+      if (state.stopped) throw new Error('stopped');
+      const txt = cardText();
+      if (/not eligible/i.test(txt)) throw new Error('image NOT eligible (moderation)');
+      if (/checking/i.test(txt)) { await sleep(800); continue; }
+      const card = cardOf();
+      const check = card && [...card.querySelectorAll('button')]
+        .find(b => /check eligibility/i.test(b.textContent || ''));
+      if (check) { check.click(); await sleep(800); continue; }
+      eligible = true;
+      break;
+    }
+    if (!eligible) throw new Error('eligibility check timed out');
+
+    let applied = false;
+    for (let attempt = 1; attempt <= CFG.selectMaxClicks && !applied; attempt++) {
+      if (state.stopped) throw new Error('stopped');
+      const btn = pickerSelectButtons().find(b => selId(b) === fid);
+      if (btn) btn.click();
+      else if (!PICKER()) break;
+      applied = await waitForNewFrame(framesBefore, CFG.selectDelayMs);
+      if (!applied && PICKER()) warn('frame not attached yet — retrying Select (' + attempt + ')');
+    }
+    await closePicker();
+  }
+
   async function uploadFrame(file) {
     await clearExistingFrames();
-    let input = startFrameInput();
-    if (!input) { await sleep(500); input = startFrameInput(); }
-    if (!input) throw new Error('start-frame file input not found in form');
+    const framesBefore = frameSrcSet();
+    await openPicker();
 
-    const dt = new DataTransfer(); dt.items.add(file);
+    // Wait until the existing picker grid is stable before snapshotting its asset ids.
+    let prev = -1, stable = 0;
+    const gridDL = Date.now() + 8000;
+    while (Date.now() < gridDL) {
+      const n = pickerSelectButtons().length;
+      if (n > 0 && n === prev) {
+        if (++stable >= 3) break;
+      } else {
+        stable = 0;
+        prev = n;
+      }
+      await sleep(250);
+    }
+    const before = new Set(pickerSelectButtons().map(selId));
+    // The picker can re-render while its grid loads, so reacquire the live input afterwards.
+    let input = pickerFileInput();
+    const inputDL = Date.now() + 4000;
+    while (!input && Date.now() < inputDL) {
+      await sleep(150);
+      input = pickerFileInput();
+    }
+    if (!input) throw new Error('hidden file input not found in assets picker');
+
+    const dt = new DataTransfer();
+    dt.items.add(file);
     input.files = dt.files;
-    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
     log('uploading ' + file.name + ' …');
 
-    // Wait for the upload to FULLY finish, not just for the local preview to show. While the
-    // file is still uploading the thumbnail src is a local "blob:" URL; once Higgsfield has the
-    // asset it becomes an https://images.higgs.ai/… URL. Clicking Generate before this point
-    // silently no-ops, so we block until the src is committed.
-    const dl = Date.now() + CFG.uploadTimeoutMs;
-    while (Date.now() < dl) {
+    let fresh = null;
+    const upDeadline = Date.now() + CFG.uploadTimeoutMs;
+    while (Date.now() < upDeadline) {
       if (state.stopped) throw new Error('stopped');
-      const im = startFrameImg();
-      const committed = im && /^https?:/.test(im.currentSrc || im.src || '');
-      if (committed) { log('start frame ready: ' + file.name); return file.name; }
-      await sleep(400);
+      if (!PICKER()) break;
+      const newOnes = pickerSelectButtons().filter(b => !before.has(selId(b)));
+      if (newOnes.length) { fresh = newOnes[0]; break; }
+      await sleep(500);
     }
-    throw new Error('start frame never finished uploading for ' + file.name);
+
+    let fid = null;
+    if (PICKER()) {
+      if (!fresh) throw new Error('upload ' + file.name + ' never appeared in the picker (timeout)');
+      fid = selId(fresh);
+      log('upload appeared (' + fid.slice(0, 8) + '…) — checking eligibility');
+      await selectEligibleAsset(fid, framesBefore);
+    }
+
+    if (!frameThumbs().some(im => !framesBefore.has(im.currentSrc || im.src))
+        && !(await waitForNewFrame(framesBefore, 8000))) {
+      throw new Error('start frame never attached to the form for ' + file.name);
+    }
+    log('start frame ready: ' + file.name);
+    return fid || file.name;
   }
 
   // ---- job lifecycle ----------------------------------------------------------
@@ -414,7 +534,7 @@
           if (r.image === lastImage && (startFrameImg() || removeButtons().length > 0)) {
             log('reusing start frame already attached: ' + r.image);          // same image still on the form — nothing to do
           } else {
-            await uploadFrame(img);                                           // new image (direct upload, instant)
+            await uploadFrame(img);                                           // new image via assets picker
             lastImage = r.image;
           }
           await setPrompt(r.prompt);
@@ -441,7 +561,8 @@
     __alive: true, CFG, discover, test, run, stop, load,
     _state: state,
     _findPromptEditor: findPromptEditor, _findGenerateButton: findGenerateButton,
-    _startFrameInput: startFrameInput, _clearExistingFrames: clearExistingFrames,
+    _pickerFileInput: pickerFileInput, _openPicker: openPicker,
+    _clearExistingFrames: clearExistingFrames,
     _uploadFrame: uploadFrame, _setPrompt: setPrompt,
   };
   log('loaded ✅  →  run  await HF.run()   (or HF.discover() / HF.test() first)');
