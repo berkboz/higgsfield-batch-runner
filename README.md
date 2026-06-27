@@ -20,7 +20,7 @@ For every row in your CSV it:
    A mismatch is cleared and re-pasted until the active editor is exactly correct.
 2. **Removes** any start‑frame image already attached to the form (so each row *replaces*, never stacks).
 3. **Opens** the **Upload media** assets picker, uploads the row's image through its hidden file input,
-   waits for eligibility, and attaches it as the start frame.
+   waits for eligibility, attaches the newest uploaded asset, and verifies that exact asset ID on the form.
 4. Clicks **Generate**, waits for the new job card to appear, then polls its status
    `queued → in_progress → completed` before moving on.
 

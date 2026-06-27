@@ -303,12 +303,18 @@
         || /images\.higgs\.ai|cloudfront|cdn\.higgsfield/.test(im.currentSrc || im.src || ''));
   }
   function startFrameImg() { return frameThumbs()[0] || null; }
-  const frameSrcSet = () => new Set(frameThumbs().map(im => im.currentSrc || im.src));
-  async function waitForNewFrame(beforeSrcs, ms) {
+  function frameHasAsset(assetId) {
+    return frameThumbs().some(im => {
+      const src = im.currentSrc || im.src || '';
+      try { return decodeURIComponent(src).includes(assetId); }
+      catch (_) { return src.includes(assetId); }
+    });
+  }
+  async function waitForFrameAsset(assetId, ms) {
     const dl = Date.now() + ms;
     while (Date.now() < dl) {
       if (state.stopped) throw new Error('stopped');
-      if (frameThumbs().some(im => !beforeSrcs.has(im.currentSrc || im.src))) return true;
+      if (frameHasAsset(assetId)) return true;
       await sleep(400);
     }
     return false;
@@ -343,7 +349,7 @@
     if (c) { c.click(); await sleep(300); }
   }
 
-  async function selectEligibleAsset(fid, framesBefore) {
+  async function selectEligibleAsset(fid) {
     const cardOf = () => {
       const b = pickerSelectButtons().find(x => selId(x) === fid);
       return b ? (b.closest('[data-assets-picker-media-card="true"]') || b.parentElement) : null;
@@ -373,31 +379,34 @@
       const btn = pickerSelectButtons().find(b => selId(b) === fid);
       if (btn) btn.click();
       else if (!PICKER()) break;
-      applied = await waitForNewFrame(framesBefore, CFG.selectDelayMs);
+      applied = await waitForFrameAsset(fid, CFG.selectDelayMs);
       if (!applied && PICKER()) warn('frame not attached yet — retrying Select (' + attempt + ')');
     }
     await closePicker();
+    if (!applied) throw new Error('selected asset ' + fid + ' never attached to the form');
   }
 
   async function uploadFrame(file) {
     await clearExistingFrames();
-    const framesBefore = frameSrcSet();
     await openPicker();
 
-    // Wait until the existing picker grid is stable before snapshotting its asset ids.
-    let prev = -1, stable = 0;
-    const gridDL = Date.now() + 8000;
+    // The picker lazy-loads old cards. Wait until both its count and newest/top id are
+    // stable before uploading; otherwise a late old card can look like our new upload.
+    let prevSignature = '', stable = 0;
+    const gridDL = Date.now() + 12000;
     while (Date.now() < gridDL) {
-      const n = pickerSelectButtons().length;
-      if (n > 0 && n === prev) {
-        if (++stable >= 3) break;
+      const buttons = pickerSelectButtons();
+      const signature = buttons.length + ':' + (buttons[0] ? selId(buttons[0]) : '');
+      if (buttons.length > 0 && signature === prevSignature) {
+        if (++stable >= 8) break;
       } else {
         stable = 0;
-        prev = n;
+        prevSignature = signature;
       }
       await sleep(250);
     }
-    const before = new Set(pickerSelectButtons().map(selId));
+    const beforeTop = pickerSelectButtons()[0];
+    const beforeTopId = beforeTop ? selId(beforeTop) : null;
     // The picker can re-render while its grid loads, so reacquire the live input afterwards.
     let input = pickerFileInput();
     const inputDL = Date.now() + 4000;
@@ -414,13 +423,29 @@
     input.dispatchEvent(new Event('change', { bubbles: true }));
     log('uploading ' + file.name + ' …');
 
-    let fresh = null;
+    // Uploads are prepended as the newest/top card. Only accept a changed top id whose
+    // own image URL contains that id. Never infer freshness from any other newly rendered
+    // card: the virtualized grid continuously adds old assets while it loads.
+    let fresh = null, candidateId = null, candidateStable = 0;
     const upDeadline = Date.now() + CFG.uploadTimeoutMs;
     while (Date.now() < upDeadline) {
       if (state.stopped) throw new Error('stopped');
       if (!PICKER()) break;
-      const newOnes = pickerSelectButtons().filter(b => !before.has(selId(b)));
-      if (newOnes.length) { fresh = newOnes[0]; break; }
+      const top = pickerSelectButtons()[0];
+      const id = top ? selId(top) : null;
+      const card = top && (top.closest('[data-assets-picker-media-card="true"]') || top.parentElement);
+      const img = card && card.querySelector('img');
+      const src = img && (img.currentSrc || img.src || '');
+      const ready = id && id !== beforeTopId && src.includes(id)
+        && !/uploading/i.test(PICKER().textContent || '');
+      if (ready) {
+        if (id === candidateId) candidateStable++;
+        else { candidateId = id; candidateStable = 1; }
+        if (candidateStable >= 3) { fresh = top; break; }
+      } else {
+        candidateId = null;
+        candidateStable = 0;
+      }
       await sleep(500);
     }
 
@@ -429,13 +454,11 @@
       if (!fresh) throw new Error('upload ' + file.name + ' never appeared in the picker (timeout)');
       fid = selId(fresh);
       log('upload appeared (' + fid.slice(0, 8) + '…) — checking eligibility');
-      await selectEligibleAsset(fid, framesBefore);
+      await selectEligibleAsset(fid);
     }
 
-    if (!frameThumbs().some(im => !framesBefore.has(im.currentSrc || im.src))
-        && !(await waitForNewFrame(framesBefore, 8000))) {
-      throw new Error('start frame never attached to the form for ' + file.name);
-    }
+    if (fid && !frameHasAsset(fid) && !(await waitForFrameAsset(fid, 8000)))
+      throw new Error('wrong or missing start frame for ' + file.name + ' (expected asset ' + fid + ')');
     log('start frame ready: ' + file.name);
     return fid || file.name;
   }
