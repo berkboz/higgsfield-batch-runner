@@ -584,9 +584,15 @@
   const cardById = id => document.querySelector(`[data-asset-id="${id}"][data-job-status]`);
   // The newest result card whose id wasn't present before we clicked Generate.
   // (History is newest-first, so this is robust even if the job id were ever swapped.)
-  function firstNewCard(before) {
+  // runningOnly: only accept a card that is actually RUNNING. The history list is virtualized,
+  // so clicking Generate can render a PREVIOUS, already-`completed` video into the DOM — its id
+  // isn't in `before` (it was scrolled off-screen at snapshot time), so a plain "first new card"
+  // wrongly latches onto it and reports the row done in 0 ms while the real job is still rendering.
+  function firstNewCard(before, runningOnly) {
     for (const el of withStatusEls()) {
-      if (!before.has(el.getAttribute('data-asset-id'))) return el;
+      if (before.has(el.getAttribute('data-asset-id'))) continue;
+      if (runningOnly && !RUNNING_STATUS.has(el.getAttribute('data-job-status'))) continue;
+      return el;
     }
     return null;
   }
@@ -605,11 +611,11 @@
       const dl = Date.now() + CFG.generateRetryMs;
       while (Date.now() < dl) {
         if (state.stopped) throw new Error('stopped');
-        card = firstNewCard(before);
-        if (card) break;
+        card = firstNewCard(before, true);   // RUNNING-only: ignore old completed cards the
+        if (card) break;                     // virtualized history may render in on this click
         await sleep(1000);
       }
-      if (!card) warn('no job appeared — clicking Generate again');
+      if (!card) warn('no running job appeared — clicking Generate again');
     }
     if (!card) { warn('Generate never produced a job (start frame may not be ready)'); return { ok: false, status: 'no-job' }; }
     const jobId = card.getAttribute('data-asset-id');
@@ -621,7 +627,9 @@
     let last = null, unknownStatus = null, unknownSince = 0;
     while (Date.now() < doneDeadline) {
       if (state.stopped) throw new Error('stopped');
-      const el = cardById(jobId) || firstNewCard(before);
+      // Track THIS job by id only. Don't fall back to "first new card" — that can re-latch onto
+      // a different (stale) card. If it briefly unmounts, '(card gone)' is treated as still-running.
+      const el = cardById(jobId);
       const status = el ? el.getAttribute('data-job-status') : '(card gone)';
       if (status !== last) { log('  status: ' + status); last = status; }
 
