@@ -368,6 +368,103 @@
     if (c) { c.click(); await sleep(300); }
   }
 
+  // ---- @-mention Elements (e.g. @BALDY-App) ----------------------------------
+  // A prompt may reference saved Elements with @Name tokens. For each one that exists in
+  // "My Elements", we open the assets picker's Elements tab, select the matching card, and
+  // click "Use" — which attaches the element to the prompt box (toast: "1 element added").
+  // This is the menu flow the UI itself uses; pasting "@Name" as plain text does NOT attach it.
+  const elementMentions = text =>
+    [...new Set([...String(text || '').matchAll(/@([A-Za-z0-9._-]+)/g)].map(m => m[1]))];
+
+  // Clickable element cards inside the open picker, e.g. label "@BALDY-AppProp".
+  function elementCards() {
+    const p = PICKER();
+    if (!p) return [];
+    return [...p.querySelectorAll('div[role="button"]')]
+      .filter(el => visible(el) && /cursor-pointer/.test((el.className || '').toString())
+                    && /^@[A-Za-z0-9._-]+/.test((el.textContent || '').trim()));
+  }
+  const elementNameOf = card => {
+    // The name and the type ("Prop"/"Character") are separate <p> leaves; the card's
+    // textContent concatenates them ("@BALDY-AppProp"), so read the leaf that is exactly "@name".
+    const leaf = [...card.querySelectorAll('*')]
+      .filter(e => e.children.length === 0)
+      .map(e => (e.textContent || '').trim())
+      .find(t => /^@[A-Za-z0-9._-]+$/.test(t));
+    const m = (leaf || '').match(/^@([A-Za-z0-9._-]+)$/);
+    return m ? m[1] : '';
+  };
+
+  // Open the picker on the Elements tab (the form's "Elements" button opens it there).
+  async function openElementsPicker() {
+    if (PICKER() && elementCards().length) return;
+    if (!PICKER()) {
+      const btn = [...FORM().querySelectorAll('button')]
+        .find(b => visible(b) && /^elements$/i.test((b.textContent || '').replace(/\s+/g, ' ').trim()));
+      if (!btn) throw new Error('Elements button not found');
+      btn.click();
+      await sleep(600);
+    }
+    // Make sure the Elements tab (not Uploads) is active inside the popover.
+    const tab = PICKER() && [...PICKER().querySelectorAll('button')]
+      .find(b => visible(b) && /^elements$/i.test((b.textContent || '').trim()));
+    if (tab) { tab.click(); }
+    const dl = Date.now() + 6000;
+    while (Date.now() < dl) {
+      if (state.stopped) throw new Error('stopped');
+      if (elementCards().length) return;
+      await sleep(200);
+    }
+    throw new Error('Elements picker did not open / no elements listed');
+  }
+
+  function findElementCard(name) {
+    const want = name.toLowerCase();
+    return elementCards().find(c => elementNameOf(c).toLowerCase() === want) || null;
+  }
+
+  // Attach one element by name. Returns true if attached, false if no such element exists
+  // (so an @mention that isn't a saved element is just left as prompt text).
+  async function attachElement(name) {
+    await openElementsPicker();
+
+    let card = findElementCard(name);
+    if (!card) {                                   // try the picker's search box for big libraries
+      const search = PICKER() && PICKER().querySelector('input[type="text"], input[placeholder]');
+      if (search) {
+        const proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+        const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value').set;
+        if (setter) setter.call(search, name); else search.value = name;
+        search.dispatchEvent(new Event('input', { bubbles: true }));
+        const dl = Date.now() + 4000;
+        while (!card && Date.now() < dl) { await sleep(250); card = findElementCard(name); }
+      }
+    }
+    if (!card) { warn('element @' + name + ' not found in My Elements — leaving as text'); await closePicker(); return false; }
+
+    card.click();                                  // select the card
+    await sleep(500);
+    const useBtn = [...PICKER().querySelectorAll('button')]
+      .find(b => visible(b) && /^\+?\s*use$/i.test((b.textContent || '').replace(/\s+/g, ' ').trim()));
+    if (!useBtn) { await closePicker(); throw new Error('Use button not found after selecting @' + name); }
+    useBtn.click();
+    await sleep(1200);
+    await closePicker();
+    log('attached element @' + name);
+    return true;
+  }
+
+  // Attach every known element referenced in the prompt (skips unknown @mentions).
+  async function attachPromptElements(text) {
+    const names = elementMentions(text);
+    const attached = [];
+    for (const name of names) {
+      if (state.stopped) throw new Error('stopped');
+      if (await attachElement(name)) attached.push(name);
+    }
+    return attached;
+  }
+
   async function selectEligibleAsset(fid) {
     const cardOf = () => {
       const b = pickerSelectButtons().find(x => selId(x) === fid);
@@ -636,7 +733,9 @@
     await setPrompt(r.prompt);
     await uploadFrame(img);
     await ensurePrompt(r.prompt);
-    log('TEST done — prompt + start frame set. Generate was NOT clicked.');
+    const got = await attachPromptElements(r.prompt);
+    if (got.length) log('elements attached: ' + got.map(n => '@' + n).join(', '));
+    log('TEST done — prompt + start frame' + (got.length ? ' + elements' : '') + ' set. Generate was NOT clicked.');
   }
 
   // ---- main loop --------------------------------------------------------------
@@ -665,13 +764,21 @@
           } catch (promptError) {
             throw new Error('Prompt setup failed — ' + (promptError.message || promptError));
           }
-          if (r.image === lastImage && (startFrameImg() || removeButtons().length > 0)) {
+          const elKey = elementMentions(r.prompt).join(',');
+          // Frame reuse is only safe when the row has no @elements. Attaching an element adds a
+          // media thumbnail, and setPrompt (run every row) wipes the in-editor mention chip, so
+          // element rows always rebuild (clear → upload → re-attach) to avoid stacking duplicates.
+          if (!elKey && r.image === lastImage && (startFrameImg() || removeButtons().length > 0)) {
             log('reusing start frame already attached: ' + r.image);          // same image still on the form — nothing to do
           } else {
-            await uploadFrame(img);                                           // new image via assets picker
+            await uploadFrame(img);                                           // clears all media + uploads the start frame
             lastImage = r.image;
           }
-          await ensurePrompt(r.prompt);                   // repair if picker disturbed it
+          await ensurePrompt(r.prompt);                   // make the prompt text correct BEFORE attaching elements
+          if (elKey) {                                    // attach @elements (e.g. @BALDY-App) as the LAST prompt edit
+            const got = await attachPromptElements(r.prompt);
+            if (got.length) log('elements attached: ' + got.map(n => '@' + n).join(', '));
+          }
           const res = await clickGenerateAndWait();      // blocks until completed OR a terminal status
           if (res.ok) { log('✅ row ' + (i + 1) + ' done — ' + r.image); summary.done.push(r.image); }
           else { warn('⏭️ row ' + (i + 1) + ' skipped — ' + r.image + ' (' + res.status + ')'); summary.skipped.push(r.image + ' (' + res.status + ')'); }
@@ -706,6 +813,8 @@
     _pickerFileInput: pickerFileInput, _openPicker: openPicker,
     _clearExistingFrames: clearExistingFrames,
     _uploadFrame: uploadFrame, _setPrompt: setPrompt,
+    _attachElement: attachElement, _attachPromptElements: attachPromptElements,
+    _elementMentions: elementMentions,
   };
   log('loaded ✅  →  run  await HF.run()   (or HF.discover() / HF.test() first)');
 })();
