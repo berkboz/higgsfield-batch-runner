@@ -156,25 +156,38 @@
     return currentPrompt(editor) === normalizedPrompt(text);
   }
 
-  async function waitForPrompt(editor, text, ms) {
+  async function waitForPrompt(text, ms) {
     const dl = Date.now() + ms;
-    while (!promptMatches(editor, text) && Date.now() < dl) await sleep(100);
-    return promptMatches(editor, text);
+    while (Date.now() < dl) {
+      const live = findPromptEditor();
+      if (live && promptMatches(live, text)) return live;
+      await sleep(100);
+    }
+    return null;
   }
 
   // Delete first, then paste into an EMPTY Lexical editor. Pasting over a selection can
   // append instead of replace; insertText with a multiline string can keep only fragments.
   async function clearContentEditableValue(editor) {
     for (let attempt = 0; attempt < 2; attempt++) {
+      // Generate can re-render and replace the entire editor node. Never keep operating
+      // on a detached reference from the previous row.
+      editor = findPromptEditor() || editor;
       editor.focus();
-      document.execCommand('selectAll', false, null);
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
       document.execCommand('delete', false, null);
-      if (await waitForPrompt(editor, '', 1200)) return true;
+      const clearedLiveEditor = await waitForPrompt('', 1200);
+      if (clearedLiveEditor) return clearedLiveEditor;
     }
-    return false;
+    return null;
   }
   async function replaceContentEditableValue(editor, text) {
-    if (!await clearContentEditableValue(editor)) return false;
+    editor = await clearContentEditableValue(editor);
+    if (!editor) return false;
 
     try {
       const dt = new DataTransfer();
@@ -183,11 +196,12 @@
         clipboardData: dt, bubbles: true, cancelable: true,
       }));
     } catch (_) {}
-    if (await waitForPrompt(editor, text, 5000)) return true;
+    if (await waitForPrompt(text, 5000)) return true;
 
     // Fallback: start clean again and insert one paragraph at a time. This avoids
     // Lexical's broken handling of one large multiline insertText transaction.
-    if (!await clearContentEditableValue(editor)) return false;
+    editor = await clearContentEditableValue(editor);
+    if (!editor) return false;
     try {
       const lines = text.replace(/\r\n?/g, '\n').split('\n');
       for (let i = 0; i < lines.length; i++) {
@@ -197,7 +211,7 @@
     } catch (_) {
       return false;
     }
-    return waitForPrompt(editor, text, 5000);
+    return Boolean(await waitForPrompt(text, 5000));
   }
   async function setPrompt(text) {
     const editor = findPromptEditor();
@@ -227,7 +241,7 @@
     // Lexical/contenteditable path.
     if (!await replaceContentEditableValue(editor, text)) {
       throw new Error('Prompt replace failed (Lexical/contenteditable; expected '
-        + normalizedPrompt(text).length + ', got ' + currentPrompt(editor).length + ' normalized chars)');
+        + normalizedPrompt(text).length + ', got ' + currentPrompt().length + ' normalized chars)');
     }
     log('prompt replaced (' + want + '/' + want + ' chars)');
   }
