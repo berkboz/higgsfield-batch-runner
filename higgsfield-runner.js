@@ -167,19 +167,26 @@
     return null;
   }
 
-  // Delete first, then paste into an EMPTY Lexical editor. Pasting over a selection can
-  // append instead of replace; insertText with a multiline string can keep only fragments.
+  // Select the editor's whole contents, then yield a tick. CRITICAL: Lexical doesn't read
+  // the DOM selection directly — it syncs its internal selection from a 'selectionchange'
+  // event that fires on a LATER microtask. Issuing execCommand synchronously after addRange
+  // hits Lexical with a stale/empty selection, so the edit is a silent no-op (this was the
+  // cause of the "expected/got mismatch" retry loop: the old prompt was never removed).
+  async function selectAllIn(editor) {
+    editor.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    await sleep(40);   // let Lexical ingest the selection before we mutate
+  }
   async function clearContentEditableValue(editor) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       // Generate can re-render and replace the entire editor node. Never keep operating
       // on a detached reference from the previous row.
       editor = findPromptEditor() || editor;
-      editor.focus();
-      const selection = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      selection.removeAllRanges();
-      selection.addRange(range);
+      await selectAllIn(editor);
       document.execCommand('delete', false, null);
       const clearedLiveEditor = await waitForPrompt('', 1200);
       if (clearedLiveEditor) return clearedLiveEditor;
@@ -187,32 +194,37 @@
     return null;
   }
   async function replaceContentEditableValue(editor, text) {
-    editor = await clearContentEditableValue(editor);
-    if (!editor) return false;
+    const lines = text.replace(/\r\n?/g, '\n').split('\n');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      editor = findPromptEditor() || editor;
+      // Select existing content first so the first insertText REPLACES it (no separate
+      // delete needed). execCommand fires real beforeinput events that Lexical honors,
+      // and per-line inserts avoid Lexical mangling one big multiline transaction.
+      await selectAllIn(editor);
+      try {
+        for (let i = 0; i < lines.length; i++) {
+          if (i) document.execCommand('insertParagraph', false, null);
+          if (lines[i]) document.execCommand('insertText', false, lines[i]);
+        }
+      } catch (_) {}
+      if (await waitForPrompt(text, 5000)) return true;
 
-    try {
-      const dt = new DataTransfer();
-      dt.setData('text/plain', text);
-      editor.dispatchEvent(new ClipboardEvent('paste', {
-        clipboardData: dt, bubbles: true, cancelable: true,
-      }));
-    } catch (_) {}
-    if (await waitForPrompt(text, 5000)) return true;
-
-    // Fallback: start clean again and insert one paragraph at a time. This avoids
-    // Lexical's broken handling of one large multiline insertText transaction.
-    editor = await clearContentEditableValue(editor);
-    if (!editor) return false;
-    try {
-      const lines = text.replace(/\r\n?/g, '\n').split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        if (i) document.execCommand('insertParagraph', false, null);
-        if (lines[i]) document.execCommand('insertText', false, lines[i]);
+      // Fallback: clear, then a beforeinput carrying a DataTransfer. Lexical's paste path
+      // reads event.dataTransfer directly — unlike a synthetic ClipboardEvent, whose
+      // clipboardData is null in Chrome, so the old paste delivered nothing.
+      editor = await clearContentEditableValue(findPromptEditor() || editor);
+      if (editor) {
+        try {
+          const dt = new DataTransfer();
+          dt.setData('text/plain', text);
+          editor.dispatchEvent(new InputEvent('beforeinput', {
+            inputType: 'insertFromPaste', dataTransfer: dt, bubbles: true, cancelable: true,
+          }));
+        } catch (_) {}
+        if (await waitForPrompt(text, 5000)) return true;
       }
-    } catch (_) {
-      return false;
     }
-    return Boolean(await waitForPrompt(text, 5000));
+    return false;
   }
   async function setPromptAttempt(text) {
     const editor = findPromptEditor();
