@@ -47,6 +47,7 @@
   const CFG = {
     clearTimeoutMs:    10000,         // max time to remove existing start frame(s)
     promptRetryMs:     1500,          // pause before clearing/re-pasting a mismatched prompt
+    promptMaxAttempts: 6,             // give up setting the prompt after this many tries (then skip the row)
     uploadTimeoutMs:   60000,         // max wait for an uploaded file to appear in the picker grid
     eligTimeoutMs:     40000,         // max wait for the picker eligibility check
     selectDelayMs:     6000,          // wait per attempt for the selected frame to attach
@@ -174,32 +175,6 @@
     return null;
   }
 
-  // Select the editor's whole contents, then yield a tick. CRITICAL: Lexical doesn't read
-  // the DOM selection directly — it syncs its internal selection from a 'selectionchange'
-  // event that fires on a LATER microtask. Issuing execCommand synchronously after addRange
-  // hits Lexical with a stale/empty selection, so the edit is a silent no-op (this was the
-  // cause of the "expected/got mismatch" retry loop: the old prompt was never removed).
-  async function selectAllIn(editor) {
-    editor.focus();
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    await sleep(40);   // let Lexical ingest the selection before we mutate
-  }
-  async function clearContentEditableValue(editor) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      // Generate can re-render and replace the entire editor node. Never keep operating
-      // on a detached reference from the previous row.
-      editor = findPromptEditor() || editor;
-      await selectAllIn(editor);
-      document.execCommand('delete', false, null);
-      const clearedLiveEditor = await waitForPrompt('', 1200);
-      if (clearedLiveEditor) return clearedLiveEditor;
-    }
-    return null;
-  }
   // A canonical Lexical editor state: root → one paragraph per line (blank line = empty paragraph).
   function buildLexicalState(text) {
     const children = String(text).replace(/\r\n?/g, '\n').split('\n').map(line => ({
@@ -225,23 +200,12 @@
     } catch (_) { return false; }
   }
   async function replaceContentEditableValue(editor, text) {
-    // Primary: Lexical's editor-state API — no DOM mutation, decorator-safe, fires listeners.
-    if (setLexicalValue(findPromptEditor() || editor, text) && await waitForPrompt(text, 4000)) return true;
-
-    // Last-resort fallback (only if the Lexical instance is unreachable): legacy execCommand path.
-    const lines = text.replace(/\r\n?/g, '\n').split('\n');
-    for (let attempt = 0; attempt < 2; attempt++) {
-      editor = findPromptEditor() || editor;
-      await selectAllIn(editor);
-      try {
-        for (let i = 0; i < lines.length; i++) {
-          if (i) document.execCommand('insertParagraph', false, null);
-          if (lines[i]) document.execCommand('insertText', false, lines[i]);
-        }
-      } catch (_) {}
-      if (await waitForPrompt(text, 4000)) return true;
-    }
-    return false;
+    // ONLY Lexical's editor-state API. We deliberately do NOT fall back to execCommand: mutating
+    // the DOM directly is exactly what threw "Lexical error #222" and permanently emptied the
+    // editor (the all-night "0 chars" loop). setEditorState rebuilds the whole document from
+    // scratch, so it works even if the editor is currently empty. If it fails, setPrompt retries
+    // cleanly and — past the attempt cap — the row is skipped with the editor left intact.
+    return setLexicalValue(findPromptEditor() || editor, text) && !!(await waitForPrompt(text, 4000));
   }
   async function setPromptAttempt(text) {
     const editor = findPromptEditor();
@@ -276,12 +240,13 @@
     log('prompt replaced (' + want + '/' + want + ' chars)');
   }
 
-  // Higgsfield can commit a Lexical paste several seconds late or replace the editor
-  // node during a generation. Never abort/skip a row for that transient mismatch:
-  // reacquire, clear and paste again until the active editor is exactly correct.
+  // Higgsfield can commit a prompt change a beat late or re-render the editor node mid-batch, so
+  // we reacquire and retry a few times. But the retry is CAPPED (promptMaxAttempts): a permanent
+  // failure must NOT loop forever — that's what burned a whole night ("0 chars" forever). On
+  // exhaustion we throw, and the run loop skips the row and moves on.
   async function setPrompt(text) {
     let attempt = 0;
-    while (!state.stopped) {
+    while (!state.stopped && attempt < CFG.promptMaxAttempts) {
       attempt++;
       const live = findPromptEditor();
       if (live && promptMatches(live, text)) {
@@ -292,12 +257,13 @@
         await setPromptAttempt(text);
         return;
       } catch (e) {
-        warn('prompt mismatch — clearing and retrying (attempt ' + attempt + '): '
+        warn('prompt mismatch — clearing and retrying (attempt ' + attempt + '/' + CFG.promptMaxAttempts + '): '
           + (e.message || e));
         await sleep(CFG.promptRetryMs);
       }
     }
-    throw new Error('stopped');
+    if (state.stopped) throw new Error('stopped');
+    throw new Error('prompt did not stick after ' + CFG.promptMaxAttempts + ' attempts — skipping row');
   }
 
   async function ensurePrompt(text) {
