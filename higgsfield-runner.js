@@ -200,13 +200,38 @@
     }
     return null;
   }
+  // A canonical Lexical editor state: root → one paragraph per line (blank line = empty paragraph).
+  function buildLexicalState(text) {
+    const children = String(text).replace(/\r\n?/g, '\n').split('\n').map(line => ({
+      type: 'paragraph', version: 1, direction: 'ltr', format: '', indent: 0, textFormat: 0,
+      children: line ? [{ type: 'text', version: 1, text: line, format: 0, style: '', mode: 'normal', detail: 0 }] : [],
+    }));
+    return { root: { type: 'root', version: 1, direction: 'ltr', format: '', indent: 0, children } };
+  }
+  // Set the prompt through Lexical's OWN API (editor.setEditorState). This is the robust path:
+  // it replaces the entire document — including any @mention decorator node left over from the
+  // previous row — WITHOUT us mutating the DOM. Mutating via execCommand fights Lexical's
+  // MutationObserver and throws "Lexical error #222" once a decorator is present, which then
+  // permanently empties the editor (the all-night "expected 1110, got 0 chars" retry loop).
+  // setEditorState also fires update listeners, so Higgsfield's React state syncs and Generate
+  // submits the right prompt. Verified live, including the attach-element-then-replace case.
+  function setLexicalValue(editorEl, text) {
+    const editor = editorEl && editorEl.__lexicalEditor;
+    if (!editor || typeof editor.setEditorState !== 'function' || typeof editor.parseEditorState !== 'function')
+      return false;
+    try {
+      editor.setEditorState(editor.parseEditorState(JSON.stringify(buildLexicalState(text))));
+      return true;
+    } catch (_) { return false; }
+  }
   async function replaceContentEditableValue(editor, text) {
+    // Primary: Lexical's editor-state API — no DOM mutation, decorator-safe, fires listeners.
+    if (setLexicalValue(findPromptEditor() || editor, text) && await waitForPrompt(text, 4000)) return true;
+
+    // Last-resort fallback (only if the Lexical instance is unreachable): legacy execCommand path.
     const lines = text.replace(/\r\n?/g, '\n').split('\n');
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       editor = findPromptEditor() || editor;
-      // Select existing content first so the first insertText REPLACES it (no separate
-      // delete needed). execCommand fires real beforeinput events that Lexical honors,
-      // and per-line inserts avoid Lexical mangling one big multiline transaction.
       await selectAllIn(editor);
       try {
         for (let i = 0; i < lines.length; i++) {
@@ -214,22 +239,7 @@
           if (lines[i]) document.execCommand('insertText', false, lines[i]);
         }
       } catch (_) {}
-      if (await waitForPrompt(text, 5000)) return true;
-
-      // Fallback: clear, then a beforeinput carrying a DataTransfer. Lexical's paste path
-      // reads event.dataTransfer directly — unlike a synthetic ClipboardEvent, whose
-      // clipboardData is null in Chrome, so the old paste delivered nothing.
-      editor = await clearContentEditableValue(findPromptEditor() || editor);
-      if (editor) {
-        try {
-          const dt = new DataTransfer();
-          dt.setData('text/plain', text);
-          editor.dispatchEvent(new InputEvent('beforeinput', {
-            inputType: 'insertFromPaste', dataTransfer: dt, bubbles: true, cancelable: true,
-          }));
-        } catch (_) {}
-        if (await waitForPrompt(text, 5000)) return true;
-      }
+      if (await waitForPrompt(text, 4000)) return true;
     }
     return false;
   }
