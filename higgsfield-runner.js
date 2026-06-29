@@ -48,7 +48,8 @@
     clearTimeoutMs:    10000,         // max time to remove existing start frame(s)
     promptRetryMs:     1500,          // pause before clearing/re-pasting a mismatched prompt
     promptMaxAttempts: 6,             // give up setting the prompt after this many tries (then skip the row)
-    uploadTimeoutMs:   60000,         // max wait for an uploaded file to appear in the picker grid
+    uploadTimeoutMs:   120000,        // max wait for an uploaded file to appear in the picker grid
+    pickerOpenMs:      12000,         // max wait for the assets picker to open after clicking Upload media
     eligTimeoutMs:     40000,         // max wait for the picker eligibility check
     selectDelayMs:     6000,          // wait per attempt for the selected frame to attach
     selectMaxClicks:   15,            // max Select retries
@@ -73,6 +74,32 @@
   const err     = (...a) => console.error('[HF]', ...a);
   const visible = el => el && el.offsetParent !== null && el.getClientRects().length > 0;
   const hasCls  = (el, s) => el && typeof el.className === 'string' && el.className.includes(s);
+
+  // ---- keep-alive (defeat background-tab timer throttling) --------------------
+  // When the laptop goes idle / the tab loses focus, Chrome throttles setTimeout to ~once a
+  // minute. That stretched our 400ms upload-polls to 60s and made every upload "time out" even
+  // though the file uploaded fine (this is exactly what skipped rows 59→86 overnight). An
+  // AudioContext producing (inaudible) output marks the tab "audible", which exempts it from
+  // that throttling. Started from the green button's click so the autoplay policy lets it run.
+  const keepAlive = { ctx: null, on: false };
+  function startKeepAlive() {
+    if (keepAlive.on) { if (keepAlive.ctx && keepAlive.ctx.state !== 'running') keepAlive.ctx.resume().catch(() => {}); return; }
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) { warn('no AudioContext — keep the tab foreground / run `caffeinate -dimsu`'); return; }
+      const ctx = new Ctx();
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      gain.gain.value = 0.0001;                  // inaudible, but enough to flag the tab as audible
+      osc.type = 'sine'; osc.frequency.value = 30;
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      ctx.resume && ctx.resume().catch(() => {});
+      document.addEventListener('visibilitychange', () => { if (ctx.state !== 'running') ctx.resume().catch(() => {}); });
+      keepAlive.ctx = ctx; keepAlive.on = true;
+      log('🔊 keep-alive on — background-tab timer throttling disabled while the batch runs');
+    } catch (e) { warn('keep-alive failed (keep the tab foreground / run `caffeinate -dimsu`):', e.message || e); }
+  }
+  function stopKeepAlive() { try { keepAlive.ctx && keepAlive.ctx.close(); } catch (_) {} keepAlive.ctx = null; keepAlive.on = false; }
 
   // ---- element discovery (selectors verified against the live DOM) -------------
   const FORM   = () => document.querySelector('form.generate-form') || document;
@@ -331,7 +358,7 @@
     const trigger = findDropZone() || plusAddButton();
     if (!trigger) throw new Error('Upload trigger not found (no dropzone or + button)');
     trigger.click();
-    const dl = Date.now() + 6000;
+    const dl = Date.now() + CFG.pickerOpenMs;
     while (Date.now() < dl) {
       if (state.stopped) throw new Error('stopped');
       if (pickerFileInput()) return;
@@ -676,6 +703,7 @@
 
       let stage = 0;
       btn.onclick = () => {
+        startKeepAlive();                 // first real click = the user gesture the audio keep-alive needs
         if (stage === 0) {
           const csv = document.createElement('input');
           csv.type = 'file'; csv.accept = '.csv,text/csv,text/plain';
@@ -792,6 +820,7 @@
 
   window.HF = {
     __alive: true, CFG, discover, test, run, stop, load,
+    keepAwake: startKeepAlive, stopKeepAwake: stopKeepAlive,
     _state: state,
     _findPromptEditor: findPromptEditor, _findGenerateButton: findGenerateButton,
     _pickerFileInput: pickerFileInput, _openPicker: openPicker,
