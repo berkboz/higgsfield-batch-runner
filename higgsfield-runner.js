@@ -28,6 +28,8 @@
  *    Other commands:
  *       await HF.discover()   // highlight the controls it will use
  *       await HF.test()       // dry run row 1 (sets prompt + image, NO Generate)
+ *       await HF.runNoFrames()// prompt-only batch; picks CSV only, never uploads a frame
+ *       await HF.testNoFrames() // dry run row 1 prompt only
  *       HF.stop()             // stop after the current step
  *       await HF.run(5)       // resume starting at row 6 (0-indexed)
  *
@@ -620,7 +622,7 @@
       }
       if (!card) warn('no running job appeared — clicking Generate again');
     }
-    if (!card) { warn('Generate never produced a job (start frame may not be ready)'); return { ok: false, status: 'no-job' }; }
+    if (!card) { warn('Generate never produced a job'); return { ok: false, status: 'no-job' }; }
     const jobId = card.getAttribute('data-asset-id');
     const short = jobId.slice(0, 8) + '…';
     log('job started: ' + short + ' — polling status (queued → in_progress → completed)');
@@ -681,7 +683,7 @@
   }
 
   // ---- state + file loading ---------------------------------------------------
-  const state = { rows: [], images: new Map(), stopped: false, running: false };
+  const state = { rows: [], images: new Map(), mode: null, stopped: false, running: false };
 
   // File pickers must open from a REAL click (browsers block console-triggered pickers).
   // Mount a button: first click picks the CSV, second picks the image folder.
@@ -722,6 +724,7 @@
           dir.type = 'file'; dir.webkitdirectory = true; dir.multiple = true;
           dir.onchange = () => {
             state.images = new Map([...dir.files].map(x => [x.name, x]));
+            state.mode = 'frames';
             log('loaded ' + state.images.size + ' images from folder');
             const missing = state.rows.filter(r => !state.images.has(r.image)).map(r => r.image);
             if (missing.length) warn('⚠️ ' + missing.length + ' row(s) have NO matching image:', missing);
@@ -735,9 +738,59 @@
     });
   }
 
+  // Prompt-only loader: one real click picks a CSV whose only required column is `prompt`.
+  // An optional `id` or `name` column is used only to make progress logs easier to read.
+  function loadPrompts() {
+    return new Promise((resolve, reject) => {
+      const existing = document.getElementById('hf-picker'); if (existing) existing.remove();
+      const btn = document.createElement('button');
+      btn.id = 'hf-picker';
+      btn.textContent = '📄 HF — click to pick your PROMPT CSV';
+      Object.assign(btn.style, {
+        position: 'fixed', zIndex: 2147483647, top: '14px', left: '50%',
+        transform: 'translateX(-50%)', padding: '14px 24px', background: '#38bdf8',
+        color: '#07111a', border: 'none', borderRadius: '12px',
+        font: '600 15px system-ui, sans-serif', cursor: 'pointer',
+        boxShadow: '0 6px 24px rgba(0,0,0,.45)',
+      });
+      document.body.appendChild(btn);
+      log('👉 blue button at the TOP of the page — click once to pick the prompt CSV.');
+
+      btn.onclick = () => {
+        startKeepAlive();
+        const csv = document.createElement('input');
+        csv.type = 'file'; csv.accept = '.csv,text/csv,text/plain';
+        csv.onchange = async () => {
+          const f = csv.files[0]; if (!f) return;
+          try {
+            const rows = parseCSV(await f.text());
+            if (!rows.length) throw new Error('CSV has no data rows');
+            if (!Object.prototype.hasOwnProperty.call(rows[0], 'prompt'))
+              throw new Error('CSV needs a `prompt` header');
+            const empty = rows
+              .map((r, i) => (!String(r.prompt || '').trim() ? i + 2 : null))
+              .filter(Boolean);
+            if (empty.length)
+              throw new Error('empty prompt in CSV line(s): ' + empty.join(', '));
+            state.rows = rows;
+            state.images = new Map();
+            state.mode = 'no-frames';
+            btn.remove();
+            log('loaded ' + state.rows.length + ' prompt-only rows from ' + f.name);
+            resolve(state.rows.length);
+          } catch (e) {
+            btn.remove();
+            reject(e);
+          }
+        };
+        csv.click();
+      };
+    });
+  }
+
   // ---- dry test: row 1, no Generate -------------------------------------------
   async function test() {
-    if (!state.rows.length) await load();
+    if (!state.rows.length || state.mode !== 'frames') await load();
     const r = state.rows[0];
     log('TEST row 1 →', r.image);
     const img = state.images.get(r.image);
@@ -750,10 +803,19 @@
     log('TEST done — prompt + start frame' + (got.length ? ' + elements' : '') + ' set. Generate was NOT clicked.');
   }
 
+  // Prompt-only dry run. It never adds, removes, or otherwise changes attached media.
+  async function testNoFrames() {
+    if (!state.rows.length || state.mode !== 'no-frames') await loadPrompts();
+    const r = state.rows[0];
+    await setPrompt(r.prompt);
+    await ensurePrompt(r.prompt);
+    log('TEST done — prompt set; attached media was left untouched. Generate was NOT clicked.');
+  }
+
   // ---- main loop --------------------------------------------------------------
   async function run(startIndex = 0) {
     if (state.running) { warn('already running'); return; }
-    if (!state.rows.length) await load();
+    if (!state.rows.length || state.mode !== 'frames') await load();
     state.stopped = false; state.running = true;
     const summary = { done: [], skipped: [], haltReason: null };
     let lastImage = null;   // reuse the attached frame across consecutive rows with the same image
@@ -816,10 +878,64 @@
     }
   }
 
+  // Prompt-only alternative: CSV → prompt → Generate, with no image-folder picker and no
+  // media management. Any frame manually attached by the user is left in place and reused.
+  async function runNoFrames(startIndex = 0) {
+    if (state.running) { warn('already running'); return; }
+    if (!state.rows.length || state.mode !== 'no-frames') await loadPrompts();
+    state.stopped = false; state.running = true;
+    const summary = { done: [], skipped: [], haltReason: null };
+    log('▶️ starting NO-FRAMES batch at row ' + (startIndex + 1) + ' of ' + state.rows.length);
+    try {
+      for (let i = startIndex; i < state.rows.length; i++) {
+        if (state.stopped) {
+          summary.haltReason = summary.haltReason || 'stop requested';
+          warn('stopped at row ' + (i + 1));
+          break;
+        }
+        const r = state.rows[i];
+        const label = String(r.id || r.name || ('row ' + (i + 1)));
+        log(`──── row ${i + 1}/${state.rows.length} — ${label} ────`);
+        try {
+          if (!String(r.prompt || '').trim()) throw new Error('empty prompt');
+          await setPrompt(r.prompt);
+          await ensurePrompt(r.prompt);
+          const res = await clickGenerateAndWait();
+          if (res.ok) {
+            log('✅ row ' + (i + 1) + ' done — ' + label);
+            summary.done.push(label);
+          } else {
+            warn('⏭️ row ' + (i + 1) + ' skipped — ' + label + ' (' + res.status + ')');
+            summary.skipped.push(label + ' (' + res.status + ')');
+          }
+        } catch (e) {
+          if (String(e.message || e).includes('stopped')) {
+            summary.haltReason = 'stop requested';
+            warn('stopped at row ' + (i + 1));
+            break;
+          }
+          err('row ' + (i + 1) + ' [' + label + '] error — skipping to next:', e.message || e);
+          summary.skipped.push(label + ' (error)');
+        }
+        await sleep(CFG.betweenRowsMs);
+      }
+      if (summary.haltReason)
+        err('🛑 no-frames batch halted — ' + summary.done.length + ' done, '
+          + summary.skipped.length + ' skipped — ' + summary.haltReason);
+      else
+        log('🏁 no-frames batch finished — ' + summary.done.length + ' done, '
+          + summary.skipped.length + ' skipped');
+      if (summary.skipped.length) warn('skipped rows:', summary.skipped);
+      return summary;
+    } finally {
+      state.running = false;
+    }
+  }
+
   function stop() { state.stopped = true; warn('stop requested — will halt after the current step'); }
 
   window.HF = {
-    __alive: true, CFG, discover, test, run, stop, load,
+    __alive: true, CFG, discover, test, run, testNoFrames, runNoFrames, stop, load, loadPrompts,
     keepAwake: startKeepAlive, stopKeepAwake: stopKeepAlive,
     _state: state,
     _findPromptEditor: findPromptEditor, _findGenerateButton: findGenerateButton,
@@ -829,5 +945,5 @@
     _attachElement: attachElement, _attachPromptElements: attachPromptElements,
     _elementMentions: elementMentions,
   };
-  log('loaded ✅  →  run  await HF.run()   (or HF.discover() / HF.test() first)');
+  log('loaded ✅  →  images: await HF.run()   |   prompt-only: await HF.runNoFrames()');
 })();

@@ -7,6 +7,10 @@ clicking **Generate**, and waiting for the job to finish before starting the nex
 
 No extension, no API keys, no build step. It just drives the page you're already logged into.
 
+It also has a **prompt-only / text-to-video mode** that runs without start frames or an image
+folder. Use a model that supports generation without an input image, then run
+`await HF.runNoFrames()`.
+
 > Use it on **your own** Higgsfield account and content, and within Higgsfield's Terms of Service.
 > It automates clicks you could do by hand; it doesn't bypass anything.
 
@@ -63,6 +67,28 @@ await HF.run(5)       // resume starting at row 6 (0-indexed)
 ```
 
 > Tip: run `await HF.test()` first and confirm the small thumbnail on the form is really your row‑1 image.
+
+### Prompt-only mode (no start frames)
+
+Use a CSV with a required `prompt` column. `id` or `name` is optional and is only used in logs:
+
+```csv
+id,prompt
+01,"A cinematic tracking shot through a rain-soaked neon alley..."
+02,"Wide aerial view of a glass house in a snowy forest..."
+```
+
+Then run:
+
+```js
+await HF.testNoFrames()  // row 1 dry run; sets the prompt and leaves media untouched
+await HF.runNoFrames()   // picks the CSV once, then runs every prompt sequentially
+await HF.runNoFrames(5)  // resume at row 6 (0-indexed)
+```
+
+No image-folder picker appears, and this mode never adds or removes media. If you manually
+attach a frame, it stays attached and is reused for subsequent prompts. If the form is empty,
+the batch remains text-to-video. See [`example-no-frames.csv`](./example-no-frames.csv).
 
 ---
 
